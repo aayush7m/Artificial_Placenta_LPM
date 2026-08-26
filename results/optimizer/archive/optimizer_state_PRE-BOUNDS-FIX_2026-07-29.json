@@ -1,0 +1,375 @@
+{
+  "signature": {
+    "sim_duration": 20.0,
+    "analysis_seconds": 8.0,
+    "max_step": 0.01,
+    "normalize": true,
+    "weights": {
+      "mean_flow": 1.0,
+      "flow_amplitude": 1.0,
+      "pressure_drop": 1.0
+    },
+    "amp_pctl": [
+      2.5,
+      97.5
+    ],
+    "window": [
+      "13:38:24",
+      "13:38:54"
+    ],
+    "params": [
+      "R_AO4_UA",
+      "V_BLOOD_TOTAL",
+      "C_UA"
+    ]
+  },
+  "best": {
+    "params": {
+      "R_AO4_UA": 21.082299640124923,
+      "V_BLOOD_TOTAL": 85.67599490986402,
+      "C_UA": 0.05101317328743751
+    },
+    "cost": 0.9633618790634983,
+    "metrics": {
+      "mean_flow": 188.6439902451568,
+      "flow_amplitude": 2.1411130032040546,
+      "pressure_drop": -51.96411221080749
+    },
+    "terms": {
+      "mean_flow": 0.0012572255504822742,
+      "flow_amplitude": 0.9465432056354106,
+      "pressure_drop": 0.015561447877605475
+    },
+    "timestamp": "2026-07-29T14:34:54",
+    "eval_index": 39
+  },
+  "clinical": {
+    "mean_flow": 188.40712000000002,
+    "flow_amplitude": 40.05315000000002,
+    "pressure_drop": -51.16786612903226
+  },
+  "n_sessions": 3,
+  "n_evals_total": 152,
+  "history": [
+    {
+      "params": {
+        "R_AO4_UA": 7.02710734610365,
+        "V_BLOOD_TOTAL": 145.22923195004108,
+        "C_UA": 0.06572600040298787
+      },
+      "cost": 2.515238360947466,
+      "metrics": {
+        "mean_flow": 461.3706491201086,
+        "flow_amplitude": 8.303488907551468,
+        "pressure_drop": -37.16046490361715
+      },
+      "terms": {
+        "mean_flow": 1.4487962510127461,
+        "flow_amplitude": 0.7926882428085815,
+        "pressure_drop": 0.27375386712613803
+      },
+      "timestamp": "2026-07-29T14:33:34",
+      "eval_index": 1
+    },
+    {
+      "params": {
+        "R_AO4_UA": 7.034137968174903,
+        "V_BLOOD_TOTAL": 145.22923195004108,
+        "C_UA": 0.06572600040298787
+      },
+      "cost": 2.513612037364609,
+      "metrics": {
+        "mean_flow": 461.1108613262299,
+        "flow_amplitude": 8.303055952018667,
+        "pressure_drop": -37.17367998309643
+      },
+      "terms": {
+        "mean_flow": 1.4474173870192901,
+        "flow_amplitude": 0.7926990523337449,
+        "pressure_drop": 0.2734955980115739
+      },
+      "timestamp": "2026-07-29T14:33:38",
+      "eval_index": 3
+    },
+    {
+      "params": {
+        "R_AO4_UA": 35.7338611620478,
+        "V_BLOOD_TOTAL": 61.13821848935902,
+        "C_UA": 0.05531867549152309
+      },
+      "cost": 1.4709853018661354,
+      "metrics": {
+        "mean_flow": 113.16361623139467,
+        "flow_amplitude": 0.9631638431117295,
+        "pressure_drop": -56.06288523952382
+      },
+      "terms": {
+        "mean_flow": 0.39936656198876846,
+        "flow_amplitude": 0.9759528565640473,
+        "pressure_drop": 0.09566588331331963
+      },
+      "timestamp": "2026-07-29T14:33:44",
+      "eval_index": 6
+    },
+    {
+      "params": {
+        "R_AO4_UA": 35.7338611620478,
+        "V_BLOOD_TOTAL": 61.1993872871499,
+        "C_UA": 0.05531867549152309
+      },
+      "cost": 1.4708589333224988,
+      "metrics": {
+        "mean_flow": 113.18909267407419,
+        "flow_amplitude": 0.9618844555916723,
+        "pressure_drop": -56.06170374182218
+      },
+      "terms": {
+        "mean_flow": 0.39923134181938463,
+        "flow_amplitude": 0.975984798808791,
+        "pressure_drop": 0.09564279269432323
+      },
+      "timestamp": "2026-07-29T14:33:49",
+      "eval_index": 8
+    },
+    {
+      "params": {
+        "R_AO4_UA": 21.874005485968812,
+        "V_BLOOD_TOTAL": 66.69757812561797,
+        "C_UA": 0.056980354561160754
+      },
+      "cost": 1.0875008175568324,
+      "metrics": {
+        "mean_flow": 171.58965341591704,
+        "flow_amplitude": 1.416604473645009,
+        "pressure_drop": -52.88749647039647
+      },
+      "terms": {
+        "mean_flow": 0.08926131127147943,
+        "flow_amplitude": 0.9646318835436162,
+        "pressure_drop": 0.033607622741736794
+      },
+      "timestamp": "2026-07-29T14:33:53",
+      "eval_index": 10
+    },
+    {
+      "params": {
+        "R_AO4_UA": 21.874005485968812,
+        "V_BLOOD_TOTAL": 66.76430906365171,
+        "C_UA": 0.056980354561160754
+      },
+      "cost": 1.0872155547078721,
+      "metrics": {
+        "mean_flow": 171.62785697051842,
+        "flow_amplitude": 1.4184117711020008,
+        "pressure_drop": -52.88558437431813
+      },
+      "terms": {
+        "mean_flow": 0.08905853998236157,
+        "flow_amplitude": 0.9645867610636866,
+        "pressure_drop": 0.03357025366182401
+      },
+      "timestamp": "2026-07-29T14:33:57",
+      "eval_index": 12
+    },
+    {
+      "params": {
+        "R_AO4_UA": 17.961478453105407,
+        "V_BLOOD_TOTAL": 71.58459568263487,
+        "C_UA": 0.05610935964511643
+      },
+      "cost": 1.030180147787819,
+      "metrics": {
+        "mean_flow": 202.33986174072342,
+        "flow_amplitude": 1.7918035162061585,
+        "pressure_drop": -51.21727414220288
+      },
+      "terms": {
+        "mean_flow": 0.07395018691821943,
+        "flow_amplitude": 0.955264354583693,
+        "pressure_drop": 0.0009656062859065777
+      },
+      "timestamp": "2026-07-29T14:34:05",
+      "eval_index": 16
+    },
+    {
+      "params": {
+        "R_AO4_UA": 17.979448915292068,
+        "V_BLOOD_TOTAL": 71.58459568263487,
+        "C_UA": 0.05610935964511643
+      },
+      "cost": 1.0294569024050695,
+      "metrics": {
+        "mean_flow": 202.19355387619447,
+        "flow_amplitude": 1.7959873231876315,
+        "pressure_drop": -51.22534652137662
+      },
+      "terms": {
+        "mean_flow": 0.07317363524369169,
+        "flow_amplitude": 0.9551598982055686,
+        "pressure_drop": 0.0011233689558092731
+      },
+      "timestamp": "2026-07-29T14:34:07",
+      "eval_index": 17
+    },
+    {
+      "params": {
+        "R_AO4_UA": 19.987776056256124,
+        "V_BLOOD_TOTAL": 78.23429473584949,
+        "C_UA": 0.055604097070034796
+      },
+      "cost": 0.9820398633950298,
+      "metrics": {
+        "mean_flow": 191.42236881351442,
+        "flow_amplitude": 1.8640331037949807,
+        "pressure_drop": -51.81129957660795
+      },
+      "terms": {
+        "mean_flow": 0.01600390056126543,
+        "flow_amplitude": 0.9534610110866442,
+        "pressure_drop": 0.012574951747120233
+      },
+      "timestamp": "2026-07-29T14:34:14",
+      "eval_index": 20
+    },
+    {
+      "params": {
+        "R_AO4_UA": 20.007773829532535,
+        "V_BLOOD_TOTAL": 78.23429473584949,
+        "C_UA": 0.055604097070034796
+      },
+      "cost": 0.9815009775305306,
+      "metrics": {
+        "mean_flow": 191.28054732303713,
+        "flow_amplitude": 1.862117799635314,
+        "pressure_drop": -51.819795213805286
+      },
+      "terms": {
+        "mean_flow": 0.015251161012583312,
+        "flow_amplitude": 0.9535088301510539,
+        "pressure_drop": 0.012740986366893334
+      },
+      "timestamp": "2026-07-29T14:34:16",
+      "eval_index": 21
+    },
+    {
+      "params": {
+        "R_AO4_UA": 20.37460619542178,
+        "V_BLOOD_TOTAL": 78.34848673583757,
+        "C_UA": 0.05501099882537094
+      },
+      "cost": 0.9705933429588504,
+      "metrics": {
+        "mean_flow": 188.74973697834136,
+        "flow_amplitude": 1.8681500410574472,
+        "pressure_drop": -51.95670198405082
+      },
+      "terms": {
+        "mean_flow": 0.0018184927318104535,
+        "flow_amplitude": 0.9533582242331141,
+        "pressure_drop": 0.0154166259939258
+      },
+      "timestamp": "2026-07-29T14:34:26",
+      "eval_index": 26
+    },
+    {
+      "params": {
+        "R_AO4_UA": 20.394990992316917,
+        "V_BLOOD_TOTAL": 78.34848673583757,
+        "C_UA": 0.05501099882537094
+      },
+      "cost": 0.9700747047340506,
+      "metrics": {
+        "mean_flow": 188.6091612592119,
+        "flow_amplitude": 1.8657791196651772,
+        "pressure_drop": -51.96531327082144
+      },
+      "terms": {
+        "mean_flow": 0.001072365307701119,
+        "flow_amplitude": 0.953417418613388,
+        "pressure_drop": 0.015584920812961403
+      },
+      "timestamp": "2026-07-29T14:34:28",
+      "eval_index": 27
+    },
+    {
+      "params": {
+        "R_AO4_UA": 20.43241185587368,
+        "V_BLOOD_TOTAL": 78.3442307776951,
+        "C_UA": 0.054904247673510244
+      },
+      "cost": 0.9696377101041981,
+      "metrics": {
+        "mean_flow": 188.33819315096048,
+        "flow_amplitude": 1.865781739049993,
+        "pressure_drop": -51.979107929913916
+      },
+      "terms": {
+        "mean_flow": 0.000365839937681453,
+        "flow_amplitude": 0.9534173532156649,
+        "pressure_drop": 0.015854516950851716
+      },
+      "timestamp": "2026-07-29T14:34:43",
+      "eval_index": 34
+    },
+    {
+      "params": {
+        "R_AO4_UA": 20.43241185587368,
+        "V_BLOOD_TOTAL": 78.42261419364884,
+        "C_UA": 0.054904247673510244
+      },
+      "cost": 0.9691759294856289,
+      "metrics": {
+        "mean_flow": 188.3909768696729,
+        "flow_amplitude": 1.8709530222511717,
+        "pressure_drop": -51.97642098637462
+      },
+      "terms": {
+        "mean_flow": 8.568216703871324e-05,
+        "flow_amplitude": 0.9532882426912448,
+        "pressure_drop": 0.015802004627345403
+      },
+      "timestamp": "2026-07-29T14:34:48",
+      "eval_index": 36
+    },
+    {
+      "params": {
+        "R_AO4_UA": 21.061227878121784,
+        "V_BLOOD_TOTAL": 85.67599490986402,
+        "C_UA": 0.05101317328743751
+      },
+      "cost": 0.9642378899598855,
+      "metrics": {
+        "mean_flow": 188.7946670706971,
+        "flow_amplitude": 2.1318957066905,
+        "pressure_drop": -51.95623970978237
+      },
+      "terms": {
+        "mean_flow": 0.0020569661629405594,
+        "flow_amplitude": 0.9467733322674871,
+        "pressure_drop": 0.015407591529457858
+      },
+      "timestamp": "2026-07-29T14:34:52",
+      "eval_index": 38
+    },
+    {
+      "params": {
+        "R_AO4_UA": 21.082299640124923,
+        "V_BLOOD_TOTAL": 85.67599490986402,
+        "C_UA": 0.05101317328743751
+      },
+      "cost": 0.9633618790634983,
+      "metrics": {
+        "mean_flow": 188.6439902451568,
+        "flow_amplitude": 2.1411130032040546,
+        "pressure_drop": -51.96411221080749
+      },
+      "terms": {
+        "mean_flow": 0.0012572255504822742,
+        "flow_amplitude": 0.9465432056354106,
+        "pressure_drop": 0.015561447877605475
+      },
+      "timestamp": "2026-07-29T14:34:54",
+      "eval_index": 39
+    }
+  ]
+}

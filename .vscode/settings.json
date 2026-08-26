@@ -1,0 +1,8 @@
+{
+    // recommended for 2023+ releases
+    "python.defaultInterpreterPath": "/Users/aayush7m/Documents/MyCoding/VSCodeStuff/plotting_env/bin/python3",
+
+    // explicitly set the interpreter for this workspace (fallback or override)
+    "python.interpreterPath": "/Users/aayush7m/Documents/MyCoding/VSCodeStuff/plotting_env/bin/python3",
+    "python.pythonPath": "/Users/aayush7m/Documents/MyCoding/VSCodeStuff/plotting_env/bin/python3"
+}

@@ -1,0 +1,9 @@
+# macOS / Python clutter
+.DS_Store
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Clinical recordings are not distributed — see data/README.md
+data/*.csv

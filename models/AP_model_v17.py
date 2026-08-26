@@ -1,0 +1,1086 @@
+"""
+Fetal Cardiovascular Lumped Parameter Model - v17 (fixed parameters & bugs)
+==================================================
+Topology:  Pennati et al. (Med Biol Eng Comput, 1997) for systemic circuit & Yigit for heart circuit
+AP circuit: Centrifugal pump + ECMO + restrictor + tubing (series R-L)
+
+Homeostatic mechanisms (each independently toggleable):
+  1. Arterial baroreflex          — Ursino (Am J Physiol, 1998)
+  2. Frank-Starling limitation    — Rychik (Pediatr Cardiol, 2004); Friedman (1972)
+  3. Catecholamine stress surge   — Lam et al. (Ann Thorac Surg, 2008)
+  4. Myocardial edema             — Kühle et al. (Prenat Diagn, 2024)
+  5. Venous unstressed volumes    — Ursino (1998); Magosso & Ursino (2001)
+  
+  6. Peripheral chemoreflex       — Booth et al. (Am J Physiol, 2009); Lear et al. (J Physiol, 2020)
+  7. Cerebral autoregulation      — Botkin et al. (Math Biosci Eng, 2019)
+  
+  8. Ductus arteriosus reactivity — Physiology: Kiserud (1999)
+  9. Pulmonary vascular resistance — Allison et al. (Respir Res, 2010)
+ 10. Valve regurgitation          — Kühle et al. (2024): tricuspid regurgitation observed
+ 11. RAAS                         — Kelly et al. (Am J Obstet Gynecol, 1983)
+ 12. Vasopressin                  — Raff et al. (1991); Kelly et al. (1983)
+
+Fetal-specific adaptations:
+  - Immature myocardium with limited preload reserve (Rychik, 2004)
+  - Vagal dominance with immature sympathetic innervation (Segar, Am J Physiol, 1997)
+  - Reduced α/β-adrenoceptor density in preterm (Kim et al., cited in Charest-Pekeski thesis)
+  - Baroreflex functional but attenuated in preterm (Booth et al., 2009)
+
+Experimental reference:
+  - Kühle H et al. Prenat Diagn. 2024. (echocardiographic AP assessment)
+  - Charest-Pekeski AJ. PhD thesis, University of Toronto, 2024.
+  - Charest-Pekeski AJ et al. Front Physiol. 2022;13:925772. (pumped AP)
+"""
+
+import csv
+import os
+import sys
+import numpy as np
+from scipy.integrate import solve_ivp
+from scipy.optimize import root_scalar
+import matplotlib.pyplot as plt
+from datetime import datetime
+
+# ╔══════════════════════════════════════════════════════════════════╗
+# ║  GLOBAL CONSTANTS                                                ║
+# ╚══════════════════════════════════════════════════════════════════╝
+
+START_TIME = "13:38:24"
+END_TIME   = "13:38:54"
+BLOOD_VOLUME = 70   # mL — fetal blood (~55 mL/kg × 0.6 kg) + circuit priming
+
+# ── AP circuit component R-L pairs ────────────────────────────────
+AP_RL = {
+    'ECMO':       {'R': 2.2492, 'L': 0.1451},
+    'RESTRICTOR': {'R': 0.7476, 'L': 0.1459},
+    'TUBING':     {'R': 1.0452, 'L': 0.3740},
+}
+R_AP_TOT = sum(c['R'] for c in AP_RL.values())
+L_AP_TOT = sum(c['L'] for c in AP_RL.values())
+
+
+def dPump(Q):
+    """Centrifugal pump pressure-flow characteristic (mmHg vs mL/s)."""
+    return -0.2638 * Q + 62.207
+
+
+# ╔══════════════════════════════════════════════════════════════════╗
+# ║  STATE VECTOR INDEX MAP                                          ║
+# ╚══════════════════════════════════════════════════════════════════╝
+# Vascular compartment volumes
+I_AR, I_AO1, I_AO2, I_AO3, I_AO4 = 0, 1, 2, 3, 4
+I_CA, I_BR, I_UB = 5, 6, 7
+I_PA1, I_PA2, I_LUNG = 8, 9, 10
+I_KID, I_HE, I_INTE, I_LEG = 11, 12, 13, 14
+I_UA, I_UV = 15, 16
+I_SVC, I_IVC = 17, 18
+# Heart chamber volumes
+I_RA, I_LA, I_RV, I_LV = 19, 20, 21, 22
+# Mechanism states
+I_P_CS        = 23   # Filtered carotid sinus pressure
+I_Q_AP        = 24   # AP circuit flow
+I_BARO_HR_S   = 25   # Baroreflex: sympathetic → heart rate
+I_BARO_HR_V   = 26   # Baroreflex: vagal → heart rate
+I_BARO_R_S    = 27   # Baroreflex: sympathetic → peripheral resistance
+I_BARO_VU_S   = 28   # Baroreflex: sympathetic → venous unstressed volume
+I_BARO_E_S    = 29   # Baroreflex: sympathetic → cardiac contractility
+I_C_CAT       = 30   # Catecholamine stress level (1.0 = baseline)
+I_EDEMA       = 31   # Myocardial edema progression (0 → 1)
+I_RAAS        = 32   # RAAS activity (0 → 1)
+I_AVP         = 33   # Vasopressin activity (0 → 1)
+I_X_AUTO      = 34   # Cerebral autoregulation state
+I_REGURG      = 35   # Valve regurgitation severity (0 → 1)
+N_STATES      = 36
+
+
+# ╔══════════════════════════════════════════════════════════════════╗
+# ║  MECHANISM TOGGLES                                               ║
+# ╚══════════════════════════════════════════════════════════════════╝
+
+class MechanismToggles:
+    """Master switch for each homeostatic mechanism.
+    Set any flag to False to disable that mechanism entirely.
+    """
+    def __init__(self):
+        self.baroreflex             = True   # 1. Arterial baroreflex
+        self.frank_starling         = True   # 2. Nonlinear Frank-Starling
+        self.catecholamine_stress   = True   # 3. Surgical stress surge
+        self.myocardial_edema       = True   # 4. Progressive edema / stiffening
+        self.venous_unstressed_vol  = True   # 5. Venous unstressed volumes
+        self.chemoreflex            = True   # 6. Peripheral chemoreflex
+        self.cerebral_autoregulation = True  # 7. Cerebral autoregulation
+        self.da_reactivity          = True   # 8. Ductus arteriosus reactivity
+        self.pvr_modulation         = True   # 9. Pulmonary vascular resistance
+        self.valve_regurgitation    = True   # 10. AV valve regurgitation
+        self.raas                   = True   # 11. Renin-angiotensin-aldosterone
+        self.vasopressin            = True   # 12. Arginine vasopressin
+
+
+# ╔══════════════════════════════════════════════════════════════════╗
+# ║  CLINICAL DATA LOADER  (same as v15)                             ║
+# ╚══════════════════════════════════════════════════════════════════╝
+
+class ClinicalData:
+    SAMPLE_RATE_HZ = 10.0
+
+    def __init__(self, csv_path: str):
+        if not os.path.isfile(csv_path):
+            raise FileNotFoundError(f"Clinical data file not found: {csv_path}")
+        self._times, self._flow_ml_s, self._dp_pump = [], [], []
+        self._timestamps = []
+        self._p_pre_ecmo, self._p_post_ecmo = [], []
+        self._p_post_res, self._p_pre_pump = [], []
+        with open(csv_path, newline='', encoding='utf-8-sig') as f:
+            reader = csv.reader(f)
+            next(reader); next(reader)
+            for idx, row in enumerate(reader):
+                if len(row) < 6:
+                    continue
+                t_elapsed = idx / self.SAMPLE_RATE_HZ
+                try:
+                    flow_ml_min = float(row[0])
+                    p_pre_ecmo  = float(row[2])
+                    p_post_ecmo = float(row[3])
+                    p_post_res  = float(row[4])
+                    p_pre_pump  = float(row[5])
+                except ValueError as e:
+                    print(f"CSV parse error row {idx+1}: {e}", file=sys.stderr)
+                    sys.exit(1)
+                ts = row[9].strip() if len(row) > 9 else ""
+                self._timestamps.append(ts)
+                self._flow_ml_s.append(flow_ml_min / 60.0)
+                self._dp_pump.append(p_pre_ecmo - p_pre_pump)
+                self._p_pre_ecmo.append(p_pre_ecmo)
+                self._p_post_ecmo.append(p_post_ecmo)
+                self._p_post_res.append(p_post_res)
+                self._p_pre_pump.append(p_pre_pump)
+                self._times.append(t_elapsed)
+        if not self._times:
+            raise ValueError("No valid rows in clinical CSV.")
+        for attr in ('_times', '_flow_ml_s', '_dp_pump', '_p_pre_ecmo',
+                     '_p_post_ecmo', '_p_post_res', '_p_pre_pump'):
+            setattr(self, attr, np.array(getattr(self, attr), dtype=float))
+        self._timestamps = np.array(self._timestamps)
+        self.duration = self._times[-1]
+
+    def get_time_window_indices(self, start_str, end_str):
+        fmt = "%H:%M:%S"
+        t0, t1 = datetime.strptime(start_str, fmt), datetime.strptime(end_str, fmt)
+        mask = np.zeros(len(self._timestamps), dtype=bool)
+        for i, ts in enumerate(self._timestamps):
+            if not ts:
+                continue
+            try:
+                t_row = datetime.strptime(ts, fmt)
+            except ValueError:
+                continue
+            if t0 <= t_row <= t1:
+                mask[i] = True
+        return mask
+
+
+# ╔══════════════════════════════════════════════════════════════════╗
+# ║  FETAL CARDIOVASCULAR MODEL  v16                                 ║
+# ╚══════════════════════════════════════════════════════════════════╝
+
+class ArtificialPlacentaModel:
+    """
+    Lumped-parameter model of the fetal cardiovascular system connected
+    to a pumped artificial placenta circuit, with 12 toggleable
+    homeostatic regulatory mechanisms.
+    """
+
+    def __init__(self, toggles=None):
+        self.flags = toggles if toggles is not None else MechanismToggles()
+
+        # ── Allometric scaling (28-week human equivalent) ─────────
+        GA40_wt, GA28_wt = 3500, 1000
+        k_C = (GA28_wt / GA40_wt) ** 0.335
+        k_E = 1/k_C
+        k_R = (GA28_wt / GA40_wt) ** (-0.47)
+        k_L = (GA28_wt / GA40_wt) ** (-0.33)
+
+        # ===========================================================
+        #  BASELINE CIRCUIT PARAMETERS
+        # ===========================================================
+
+        # ── Valve resistances (scaled) ────────────────────────────
+        self.R_aortic    = 0.0798 * k_R
+        self.R_pulmonary = 0.0798 * k_R
+        self.R_mitral    = 0.04002 * k_R
+        self.R_tricuspid = 0.04002 * k_R
+        self.R_FO        = 0.096 * k_R
+
+        # ── Vascular resistances (scaled) ─────────────────────────
+        self.R = {
+            'AA':     0.12 * k_R,   'ISTHS':  0.4  * k_R,
+            'THAO':   0.04 * k_R,   'ADAO':   0.06 * k_R,
+            'PA':     0.07 * k_R,  'LUNG':   13.5 * k_R,
+            'DA':     0.3  * k_R,   'CAR':    0.3  * k_R,
+            'CA_BR':  3.0  * k_R,   'BR':     8.5  * k_R,
+            'UB':     8.0  * k_R,   'UB_SVC': 4.9  * k_R,
+            'COEL':   81.0 * k_R,   'MES':    34.0 * k_R,
+            'POR':    7.0  * k_R,   'REA':    3.5  * k_R,
+            'REV':    14.0 * k_R,   'AO4_UA': 3.9 * k_R,
+            'FA':     3.5  * k_R,   'LEG_IVC':0.6  * k_R,
+            'PRSN':   0.5  * k_R,   'HV':     0.16 * k_R,
+            'DV':     1.3  * k_R,   'SVC':    0.2  * k_R,
+            'IVC':    0.12 * k_R,   'LA':     2.0 * k_R,
+        }
+        # Store baselines for mechanisms that modulate resistances
+        self.R_baseline = dict(self.R)
+
+        # ── Vascular compliances (scaled) ─────────────────────────
+        self.C = {
+            'AR':  0.05*k_C,  'AO1': 0.08*k_C, 'AO2': 0.07*k_C,
+            'AO3': 0.04*k_C,  'AO4': 0.05*k_C, 'CA':  0.01*k_C,
+            'BR':  0.3*k_C,   'UB':  0.85*k_C,  'PA1': 0.08*k_C,
+            'PA2': 0.08*k_C,  'LUNG':0.4*k_C,   'KID': 0.02*k_C,
+            'HE':  3.0*k_C,   'INTE':0.25*k_C,  'LEG': 4.0*k_C,
+            'UA':  0.1*k_C,     'UV':  0.3*k_C,   'SVC': 1.0*k_C,
+            'IVC': 0.6*k_C,
+        }
+        # Ordered list matching state indices 0-18
+        self._c_keys = ['AR','AO1','AO2','AO3','AO4','CA','BR','UB',
+                        'PA1','PA2','LUNG','KID','HE','INTE','LEG',
+                        'UA','UV','SVC','IVC']
+        self.c_list = [self.C[k] for k in self._c_keys]
+
+        # ── AP circuit R-L (not allometrically scaled) ────────────
+        self.R_ECMO = AP_RL['ECMO']['R'];       self.L_ECMO = AP_RL['ECMO']['L']
+        self.R_RES  = AP_RL['RESTRICTOR']['R'];  self.L_RES  = AP_RL['RESTRICTOR']['L']
+        self.R_TUB  = AP_RL['TUBING']['R'];      self.L_TUB  = AP_RL['TUBING']['L']
+        self.R_ap_tot = self.R_ECMO + self.R_RES + self.R_TUB
+        self.L_ap_tot = self.L_ECMO + self.L_RES + self.L_TUB
+
+        # ===========================================================
+        #  MECHANISM 2: FRANK-STARLING — nonlinear ventricular model
+        #  Refs: Rychik (2004), Friedman (1972), Gardiner (Heart,2005)
+        # ===========================================================
+        self.E_max_L  = 12.5 * k_E       # LV end-systolic elastance
+        self.E_max_R  = 12.5 * k_E       # RV end-systolic elastance
+        self.E_min_L  = 0.333 * k_E      # LV diastolic elastance
+        self.E_min_R  = 0.333 * k_E      # RV diastolic elastance
+        self.E_max_LA = 3.333* k_E;  self.E_min_LA = 1.0* k_E
+        self.E_max_RA = 2.223* k_E;  self.E_min_RA = 0.5* k_E
+
+        # Frank-Starling saturation: reduces systolic elastance at high EDV
+        # alpha = 0: linear (adult). alpha = 0.3-0.5: fetal (limited preload reserve)
+        self.fs_alpha    = 0.4          # Starling saturation coefficient
+        self.fs_V_d_frac = 0.05         # Dead volume as fraction of initial V
+        self.fs_V_ref_frac = 1.5        # Reference volume as fraction of initial V
+
+        # Exponential EDPVR: P_ed = A * (exp(B * V_eff) - 1)
+        # Higher B → stiffer diastole (fetal myocardium is stiffer)
+        self.edpvr_A = 0.002            # mmHg (scaled to model units)
+        self.edpvr_B = 0.003            # 1/volume_unit
+
+        # ===========================================================
+        #  MECHANISM 5: VENOUS UNSTRESSED VOLUMES
+        #  Ref: Ursino (Am J Physiol, 1998)
+        # ===========================================================
+        # Fraction of initial volume that is "unstressed" (generates no pressure)
+        # Set to 0.0 for any compartment to revert to v15 behavior
+        self.Vu_frac = {
+            'AR':  0.0, 'AO1': 0.0, 'AO2': 0.0, 'AO3': 0.0, 'AO4': 0.0,
+            'CA':  0.0, 'BR':  0.0, 'UB':  0.0,
+            'PA1': 0.0, 'PA2': 0.0, 'LUNG':0.0,
+            'KID': 0.0, 'HE':  0.0, 'INTE':0.0, 'LEG': 0.0,
+            'UA':  0.0, 'UV':  0.0,
+            'SVC': 0.0, 'IVC': 0.0,
+        }
+
+        # ===========================================================
+        #  MECHANISM 1: ARTERIAL BAROREFLEX (Ursino 1998 style)
+        #  5 effector arms with individual time constants.
+        #  Afferent: sigmoid of filtered carotid sinus pressure.
+        #  Refs: Ursino (1998), Segar (Am J Physiol, 1997),
+        #         Booth et al. (Am J Physiol, 2009)
+        # ===========================================================
+        self.baro_P_set    = None       # Set-point pressure — None = auto-calibrate
+                                        # from initial arterial pressure in run_simulation
+        self.baro_k        = None       # Sigmoid slope — None = auto-calibrate so that
+                                        # ±30% pressure change spans 10-90% of sigmoid
+        self.baro_tau_filt  = 1.0       # Afferent pressure filter time constant (s)
+
+        # Sympathetic effector arms: target = σ(P) decreasing sigmoid
+        self.baro_tau_HR_s  = 2.0       # Time constant: sympathetic → HR (s)
+        self.baro_tau_R_s   = 6.0       # Time constant: sympathetic → resistance (s)
+        self.baro_tau_Vu_s  = 15.0      # Time constant: sympathetic → venous tone (s)
+        self.baro_tau_E_s   = 8.0       # Time constant: sympathetic → contractility (s)
+
+        # Vagal effector arm: target = σ(P) increasing sigmoid
+        self.baro_tau_HR_v  = 1.5       # Time constant: vagal → HR (s)
+
+        # Effector gains (applied to modulated parameters)
+        self.baro_G_HR_s    = 0.5       # Sympathetic HR gain (fractional)
+        self.baro_G_HR_v    = 0.7       # Vagal HR gain (fractional, higher in fetus)
+        self.baro_G_R       = 0.5       # Sympathetic resistance gain
+        self.baro_G_Vu      = 0.3       # Sympathetic venous tone gain
+        self.baro_G_E       = 0.3       # Sympathetic contractility gain
+
+        # Intrinsic heart rate (no autonomic input), bpm → Hz
+        self.HR_intrinsic   = 140.0 / 60.0   # ~140 bpm fetal baseline
+
+        # ===========================================================
+        #  MECHANISM 3: CATECHOLAMINE STRESS RESPONSE
+        #  Biphasic surge after surgical transition to AP.
+        #  Refs: Lam et al. (Ann Thorac Surg, 2008),
+        #        Lagercrantz & Bistoletti (1973)
+        # ===========================================================
+        self.cat_C_peak     = 4.0       # Peak fold-increase over baseline
+        self.cat_tau_fast   = 300.0     # Fast decay time constant (s) ~ 5 min
+        self.cat_tau_slow   = 7200.0    # Slow decay time constant (s) ~ 2 hours
+        self.cat_w_fast     = 0.6       # Weight of fast component
+        self.cat_G_HR       = 0.15      # HR gain per unit catecholamine
+        self.cat_G_R        = 0.10      # Resistance gain (reduced: fewer α-receptors)
+        self.cat_G_E        = 0.05      # Contractility gain (reduced: fewer β₁-receptors)
+
+        # ===========================================================
+        #  MECHANISM 4: MYOCARDIAL EDEMA
+        #  Progressive diastolic stiffening from fluid accumulation.
+        #  Ref: Kühle et al. (2024) — wall thickness: 0.22→0.34 cm
+        # ===========================================================
+        self.edema_tau      = 36000.0   # Time constant (s) ~ 10 hours
+        self.edema_max_stiffening = 2.0 # Max fold-increase in diastolic stiffness
+
+        # ===========================================================
+        #  MECHANISM 6: PERIPHERAL CHEMOREFLEX
+        #  Carotid body O₂ sensing → vasoconstriction + bradycardia.
+        #  Refs: Booth et al. (2009), Lear et al. (J Physiol, 2020),
+        #        Koos & Maeda (Am J Phys, 2001)
+        # ===========================================================
+        self.PaO2           = 140.0     # Arterial PO₂ (mmHg) — AP default
+        self.chemo_PaO2_half = 18.0     # Half-activation PO₂ (mmHg)
+        self.chemo_n_hill   = 3.0       # Hill coefficient (cooperativity)
+        self.chemo_G_R      = 0.4       # Vasoconstriction gain
+        self.chemo_G_HR     = 0.3       # Bradycardia gain (fractional)
+
+        # ===========================================================
+        #  MECHANISM 7: CEREBRAL AUTOREGULATION
+        #  Myogenic response maintaining cerebral blood flow.
+        #  Refs: Botkin et al. (Math Biosci Eng, 2019),
+        #        van Bel & Mintzer (Frontiers Pediatr, 2021)
+        # ===========================================================
+        self.auto_alpha     = 0.5       # Autoregulatory strength (0=passive, 1=perfect)
+        self.auto_tau       = 10.0      # Myogenic response time constant (s)
+        # Reference cerebral perfusion pressure (model units, calibrated at init)
+        self.auto_P_ref     = None      # Set during initialization
+
+        # ===========================================================
+        #  MECHANISM 8: DUCTUS ARTERIOSUS REACTIVITY
+        #  DA resistance modulated by PaO₂ and PGE₁ infusion.
+        #  Ref: Kiserud (1999), Clyman (2006)
+        # ===========================================================
+        self.da_PaO2_half   = 40.0      # PaO₂ at half-max constriction (mmHg)
+        self.da_k_O2        = 0.08      # Sigmoid slope for O₂ response
+        self.da_G_O2        = 1.5       # Max fold-increase in R_DA from O₂
+        self.PGE1_dose      = 1.0       # Normalized PGE₁ dose (1.0 = standard infusion)
+        self.da_K_PGE       = 0.5       # PGE₁ half-effective dose
+        self.da_G_PGE       = 0.6       # Max fold-decrease in R_DA from PGE₁
+
+        # ===========================================================
+        #  MECHANISM 9: PULMONARY VASCULAR RESISTANCE MODULATION
+        #  PVR decreases with increasing PaO₂.
+        #  Ref: Allison et al. (Respir Res, 2010)
+        # ===========================================================
+        self.pvr_PaO2_ref   = 25.0      # In utero fetal PaO₂ (mmHg)
+        self.pvr_beta       = 0.3       # O₂ sensitivity exponent
+
+        # ===========================================================
+        #  MECHANISM 10: VALVE REGURGITATION
+        #  Progressive AV valve incompetence from cardiac dilation.
+        #  Ref: Kühle et al. (2024) — tricuspid regurgitation observed
+        # ===========================================================
+        self.regurg_tau           = 36000.0   # Development time constant (s)
+        self.regurg_V_threshold   = 1.2       # EDV threshold (fraction of baseline)
+        self.regurg_k_growth      = 1e-4      # Growth rate coefficient
+
+        # ===========================================================
+        #  MECHANISM 11: RENIN-ANGIOTENSIN-ALDOSTERONE SYSTEM (RAAS)
+        #  Slow vasoconstriction from reduced renal perfusion.
+        #  Ref: Kelly et al. (Am J Obstet Gynecol, 1983)
+        # ===========================================================
+        self.raas_tau       = 3600.0    # Activation time constant (s) ~ 1 hour
+        self.raas_P_half    = None      # Half-activation renal pressure (set at init)
+        self.raas_k         = None      # Sigmoid slope — None = auto-calibrate
+        self.raas_G_R       = 0.3       # Resistance gain at max RAAS
+
+        # ===========================================================
+        #  MECHANISM 12: VASOPRESSIN (AVP)
+        #  Slow vasoconstriction from arterial hypotension.
+        #  Ref: Raff et al. (1991), Kelly et al. (1983)
+        # ===========================================================
+        self.avp_tau        = 1800.0    # Activation time constant (s) ~ 30 min
+        self.avp_P_half     = None      # Half-activation MAP (set at init)
+        self.avp_k          = None      # Sigmoid slope — None = auto-calibrate
+        self.avp_G_R        = 0.2       # Resistance gain at max AVP
+
+        # ── Sets of resistances modulated by each mechanism ───────
+        # Baroreflex modulates these vascular beds:
+        self.baro_R_targets = ['BR', 'UB', 'COEL', 'MES', 'REA', 'FA']
+        # Chemoreflex modulates peripheral beds (brain-sparing):
+        self.chemo_R_targets = ['UB', 'COEL', 'MES', 'REA', 'FA', 'LEG_IVC']
+        # RAAS/AVP modulate systemic beds:
+        self.humoral_R_targets = ['BR', 'UB', 'COEL', 'MES', 'REA', 'FA', 'LEG_IVC']
+        # Venous beds modulated by unstressed volume changes:
+        self.Vu_targets = ['BR', 'UB', 'HE', 'INTE', 'LEG', 'SVC', 'IVC']
+
+    # ──────────────────────────────────────────────────────────────
+    #  AP CIRCUIT DYNAMICS
+    # ──────────────────────────────────────────────────────────────
+
+    def ap_loop(self, P_UA, P_UV, Q_AP):
+        """Compute dQ_AP/dt and node pressures in the AP circuit."""
+        pump_gain  = dPump(Q_AP)
+        dQ_AP = (P_UA + pump_gain - self.R_ap_tot * Q_AP - P_UV) / self.L_ap_tot
+        pre_ecmo   = P_UA + pump_gain
+        post_ecmo  = pre_ecmo  - (self.R_ECMO * Q_AP + self.L_ECMO * dQ_AP)
+        post_restr = post_ecmo - (self.R_RES  * Q_AP + self.L_RES  * dQ_AP)
+        return dQ_AP, pump_gain, pre_ecmo, post_ecmo, post_restr
+
+    def steady_state_flow(self, P_UA, P_UV):
+        """Q_AP that gives dQ_AP/dt = 0 for given boundary pressures."""
+        f = lambda Q: P_UA + dPump(Q) - self.R_ap_tot * Q - P_UV
+        return root_scalar(f, bracket=[-500, 500], method='brentq').root
+
+    # ──────────────────────────────────────────────────────────────
+    #  MECHANISM 2: FRANK-STARLING VENTRICULAR PRESSURE
+    # ──────────────────────────────────────────────────────────────
+
+    def ventricular_pressure(self, V, en, E_max, E_min, V_init,
+                             contractility_factor, edema_factor):
+        """
+        Nonlinear time-varying elastance with:
+          - Systolic:  ESPVR with Starling saturation at high volumes
+          - Diastolic: exponential EDPVR, stiffened by edema
+
+        When frank_starling toggle is OFF, reverts to linear P = E(t)*V.
+
+        Refs: Rychik (Pediatr Cardiol, 2004) — limited fetal preload reserve
+              Friedman (Prog Cardiovasc Dis, 1972) — immature myocardium
+              Gardiner (Heart, 2005) — fetal cardiac remodeling
+        """
+        if not self.flags.frank_starling:
+            E = (E_max * contractility_factor - E_min * edema_factor) * en \
+                + E_min * edema_factor
+            return E * V
+
+        V_d   = self.fs_V_d_frac * V_init
+        V_ref = self.fs_V_ref_frac * V_init
+        V_eff = max(0.0, V - V_d)
+
+        # ── Systolic (ESPVR with saturation) ──
+        if V_ref > 0:
+            sat = 1.0 / (1.0 + self.fs_alpha * (V_eff / V_ref) ** 2)
+        else:
+            sat = 1.0
+        P_es = E_max * contractility_factor * V_eff * sat
+
+        # ── Diastolic (exponential EDPVR) ──
+        B_eff = self.edpvr_B * edema_factor
+        exponent = min(B_eff * V_eff, 20.0)   # clamp to prevent overflow
+        P_ed  = self.edpvr_A * (np.exp(exponent) - 1.0)
+
+        # ── Combined with activation function ──
+        P = en * P_es + (1.0 - en) * P_ed
+        return max(0.0, P)
+
+    # ──────────────────────────────────────────────────────────────
+    #  MAIN ODE SYSTEM
+    # ──────────────────────────────────────────────────────────────
+
+    def compute_derivatives(self, t, x):
+        V          = x[0:23]
+        P_cs       = x[I_P_CS]
+        Q_AP       = x[I_Q_AP]
+        sigma_HR_s = x[I_BARO_HR_S]
+        sigma_HR_v = x[I_BARO_HR_V]
+        sigma_R_s  = x[I_BARO_R_S]
+        sigma_Vu_s = x[I_BARO_VU_S]
+        sigma_E_s  = x[I_BARO_E_S]
+        C_cat      = x[I_C_CAT]
+        edema      = x[I_EDEMA]
+        raas_act   = x[I_RAAS]
+        avp_act    = x[I_AVP]
+        x_auto     = x[I_X_AUTO]
+        regurg_sev = x[I_REGURG]
+
+        dx = np.zeros(N_STATES)
+
+        # ===========================================================
+        #  STEP 1: BAROREFLEX — afferent and effector targets
+        #  Ref: Ursino (Am J Physiol, 1998)
+        # ===========================================================
+        P_arterial = V[I_AR] / self.C['AR']  # aortic root pressure
+
+        if self.flags.baroreflex:
+            # Afferent: normalized baroreceptor firing (0→1, sigmoid)
+            # baro_k and baro_P_set are auto-calibrated in run_simulation
+            bk = self._baro_k_cal
+            bp = self._baro_P_set_cal
+            n_baro = 1.0 / (1.0 + np.exp(-bk * (P_cs - bp)))
+
+            # Sympathetic targets (DECREASE with rising pressure)
+            target_HR_s = 1.0 - n_baro
+            target_R_s  = 1.0 - n_baro
+            target_Vu_s = 1.0 - n_baro
+            target_E_s  = 1.0 - n_baro
+
+            # Vagal target (INCREASES with rising pressure)
+            target_HR_v = n_baro
+
+            # Effector dynamics (first-order lag, each with own τ)
+            dx[I_BARO_HR_S] = (target_HR_s - sigma_HR_s) / self.baro_tau_HR_s
+            dx[I_BARO_HR_V] = (target_HR_v - sigma_HR_v) / self.baro_tau_HR_v
+            dx[I_BARO_R_S]  = (target_R_s  - sigma_R_s)  / self.baro_tau_R_s
+            dx[I_BARO_VU_S] = (target_Vu_s - sigma_Vu_s) / self.baro_tau_Vu_s
+            dx[I_BARO_E_S]  = (target_E_s  - sigma_E_s)  / self.baro_tau_E_s
+        # else: dx for baro states remain 0 (frozen)
+
+        # Filtered carotid sinus pressure
+        dx[I_P_CS] = (P_arterial - P_cs) / self.baro_tau_filt
+
+        # ===========================================================
+        #  STEP 2: CATECHOLAMINE STRESS RESPONSE
+        #  Ref: Lam et al. (Ann Thorac Surg, 2008)
+        # ===========================================================
+        if self.flags.catecholamine_stress:
+            # Target catecholamine: biphasic decay from peak
+            C_target = 1.0 + (self.cat_C_peak - 1.0) * (
+                self.cat_w_fast * np.exp(-t / self.cat_tau_fast) +
+                (1.0 - self.cat_w_fast) * np.exp(-t / self.cat_tau_slow)
+            )
+            # Drive C_cat toward target (fast tracking)
+            dx[I_C_CAT] = (C_target - C_cat) / 10.0  # 10 s tracking τ
+        # else: C_cat stays at initial value
+
+        # ===========================================================
+        #  STEP 3: RAAS AND VASOPRESSIN
+        #  Refs: Kelly et al. (1983), Raff et al. (1991)
+        # ===========================================================
+        P_kidney = V[I_KID] / self.C['KID']
+
+        if self.flags.raas and self._raas_P_half_cal is not None:
+            # RAAS activation: inverse sigmoid of renal perfusion pressure
+            raas_target = 1.0 / (1.0 + np.exp(self._raas_k_cal * (P_kidney - self._raas_P_half_cal)))
+            dx[I_RAAS] = (raas_target - raas_act) / self.raas_tau
+
+        if self.flags.vasopressin and self._avp_P_half_cal is not None:
+            # AVP activation: inverse sigmoid of mean arterial pressure
+            avp_target = 1.0 / (1.0 + np.exp(self._avp_k_cal * (P_arterial - self._avp_P_half_cal)))
+            dx[I_AVP] = (avp_target - avp_act) / self.avp_tau
+
+        # ===========================================================
+        #  STEP 4: MYOCARDIAL EDEMA PROGRESSION
+        #  Ref: Kühle et al. (2024) — wall thickness 0.22→0.34 cm
+        # ===========================================================
+        if self.flags.myocardial_edema:
+            dx[I_EDEMA] = (1.0 - edema) / self.edema_tau
+        edema_stiffness = 1.0 + (self.edema_max_stiffening - 1.0) * edema \
+                          if self.flags.myocardial_edema else 1.0
+
+        # ===========================================================
+        #  STEP 5: COMPUTE MODULATED PARAMETERS
+        # ===========================================================
+
+        # ── Heart rate ────────────────────────────────────────────
+        HR = self.HR_intrinsic
+        if self.flags.baroreflex:
+            HR = HR * (1.0 + self.baro_G_HR_s * sigma_HR_s) \
+                    / (1.0 + self.baro_G_HR_v * sigma_HR_v)
+        if self.flags.catecholamine_stress:
+            HR = HR * (1.0 + self.cat_G_HR * (C_cat - 1.0))
+        if self.flags.chemoreflex:
+            f_chemo = 1.0 / (1.0 + (self.PaO2 / self.chemo_PaO2_half) ** self.chemo_n_hill)
+            HR = HR * (1.0 - self.chemo_G_HR * f_chemo)
+        else:
+            f_chemo = 0.0
+        HR = max(80.0 / 60.0, min(280.0 / 60.0, HR))  # clamp 80-280 bpm
+        T_cycle = 1.0 / HR
+
+        # ── Resistance multiplier (applied to selected beds) ──────
+        r_factor = 1.0
+        if self.flags.baroreflex:
+            r_factor += self.baro_G_R * sigma_R_s
+        if self.flags.catecholamine_stress:
+            r_factor += self.cat_G_R * (C_cat - 1.0)
+        if self.flags.chemoreflex:
+            r_factor += self.chemo_G_R * f_chemo
+        if self.flags.raas:
+            r_factor += self.raas_G_R * raas_act
+        if self.flags.vasopressin:
+            r_factor += self.avp_G_R * avp_act
+        r_factor = max(0.3, min(4.0, r_factor))
+
+        # ── Contractility multiplier (E_max) ──────────────────────
+        e_factor = 1.0
+        if self.flags.baroreflex:
+            e_factor += self.baro_G_E * sigma_E_s
+        if self.flags.catecholamine_stress:
+            e_factor += self.cat_G_E * (C_cat - 1.0)
+        e_factor = max(0.5, min(2.0, e_factor))
+
+        # ── Venous unstressed volume multiplier ───────────────────
+        vu_factor = 1.0
+        if self.flags.baroreflex and self.flags.venous_unstressed_vol:
+            vu_factor = 1.0 - self.baro_G_Vu * sigma_Vu_s
+            vu_factor = max(0.5, min(1.5, vu_factor))
+
+        # ===========================================================
+        #  STEP 6: CARDIAC ELASTANCE & CHAMBER PRESSURES
+        #  Ref: Pennati et al. (1997) — activation functions
+        # ===========================================================
+        t_mod = t % T_cycle
+        t_n   = t_mod * HR
+
+        # Ventricular activation
+        term1_v = (t_n / 0.303) ** 1.32
+        en_v = 1.67 * (term1_v / (1.0 + term1_v)) * \
+               (1.0 / (1.0 + (t_n / 0.508) ** 21.9))
+
+        # Atrial activation (phase-shifted)
+        t_n_a   = (t_n + 0.275) % 1.0
+        term1_a = (t_n_a / 0.303) ** 1.32
+        en_a = 2.70 * (term1_a / (1.0 + term1_a)) * \
+               (1.0 / (1.0 + (t_n_a / 0.25) ** 21.9))
+
+        # Store initial chamber volumes for Frank-Starling reference
+        # (these are set during run_simulation and cached)
+        V_RV_init = getattr(self, '_V_RV_init', V[I_RV])
+        V_LV_init = getattr(self, '_V_LV_init', V[I_LV])
+
+        # Atrial pressures (linear elastance, no Frank-Starling)
+        E_RA = (self.E_max_RA - self.E_min_RA) * en_a + self.E_min_RA
+        E_LA = (self.E_max_LA - self.E_min_LA) * en_a + self.E_min_LA
+        P_RA = E_RA * V[I_RA]
+        P_LA = E_LA * V[I_LA]
+
+        # Ventricular pressures (with Frank-Starling & edema)
+        P_RV = self.ventricular_pressure(
+            V[I_RV], en_v, self.E_max_R, self.E_min_R,
+            V_RV_init, e_factor, edema_stiffness)
+        P_LV = self.ventricular_pressure(
+            V[I_LV], en_v, self.E_max_L, self.E_min_L,
+            V_LV_init, e_factor, edema_stiffness)
+
+        # ===========================================================
+        #  STEP 7: VASCULAR COMPARTMENT PRESSURES
+        #  With optional unstressed volumes (Mechanism 5)
+        # ===========================================================
+        P = {}
+        for i, key in enumerate(self._c_keys):
+            Vu = 0.0
+            if self.flags.venous_unstressed_vol:
+                # Unstressed volume = fraction of the actual initial volume
+                # (self._V_init is cached during run_simulation)
+                Vu_base = self.Vu_frac[key] * self._V_init[i]
+                if key in self.Vu_targets:
+                    Vu = Vu_base * vu_factor
+                else:
+                    Vu = Vu_base
+            P[key] = (V[i] - Vu) / self.C[key]
+
+        # Add chamber pressures to the dict for convenience
+        P['RA'] = P_RA;  P['LA'] = P_LA;  P['RV'] = P_RV;  P['LV'] = P_LV
+
+        # ===========================================================
+        #  STEP 8: DA AND PVR REACTIVITY
+        #  Refs: Kiserud (1999), Allison et al. (2010)
+        # ===========================================================
+        R_DA_eff = self.R['DA']
+        if self.flags.da_reactivity:
+            # O₂-dependent constriction (sigmoid)
+            f_O2 = 1.0 / (1.0 + np.exp(-self.da_k_O2 * (self.PaO2 - self.da_PaO2_half)))
+            # PGE₁-dependent dilation (Michaelis-Menten)
+            f_PGE = self.PGE1_dose / (self.PGE1_dose + self.da_K_PGE)
+            R_DA_eff = self.R['DA'] * (1.0 + self.da_G_O2 * f_O2) \
+                                    * (1.0 - self.da_G_PGE * f_PGE)
+            R_DA_eff = max(self.R['DA'] * 0.3, R_DA_eff)
+
+        R_LUNG_eff = self.R['LUNG']
+        if self.flags.pvr_modulation:
+            R_LUNG_eff = self.R['LUNG'] * (self.pvr_PaO2_ref / max(1.0, self.PaO2)) \
+                         ** self.pvr_beta
+
+        # ===========================================================
+        #  STEP 9: CEREBRAL AUTOREGULATION
+        #  Ref: Botkin et al. (Math Biosci Eng, 2019)
+        # ===========================================================
+        R_CA_BR_eff = self.R['CA_BR']
+        if self.flags.cerebral_autoregulation:
+            P_cerebral = (P['AO1'] + P['CA']) / 2.0
+            P_ref = self.auto_P_ref if self.auto_P_ref is not None else P_cerebral
+            if P_ref > 0:
+                # Dynamic resistance adjustment (first-order)
+                R_target = self.R['CA_BR'] * (P_cerebral / P_ref) ** self.auto_alpha
+                dx[I_X_AUTO] = (R_target - x_auto) / self.auto_tau
+                R_CA_BR_eff = max(self.R['CA_BR'] * 0.3, x_auto)
+            else:
+                R_CA_BR_eff = self.R['CA_BR']
+
+        # ===========================================================
+        #  STEP 10: VALVE FLOWS (with regurgitation — Mechanism 10)
+        #  Ref: Kühle et al. (2024) — observed tricuspid regurgitation
+        # ===========================================================
+
+        # ── Regurgitation resistance factor ───────────────────────
+        # Exponential: severity 0 → ×100 (no leak), 1 → ×1 (severe)
+        if self.flags.valve_regurgitation and regurg_sev > 1e-6:
+            regurg_R_factor = np.exp(4.6 * (1.0 - regurg_sev))
+        else:
+            regurg_R_factor = 1e6  # effectively infinite (no regurgitation)
+
+        def valve_flow(P_up, P_down, R_fwd, allow_regurg=False):
+            dP = P_up - P_down
+            if dP >= 0:
+                return dP / R_fwd
+            elif allow_regurg and self.flags.valve_regurgitation:
+                return dP / (R_fwd * regurg_R_factor)
+            else:
+                return 0.0
+
+        Q_AoV = valve_flow(P['LV'], P['AR'], self.R_aortic)
+        Q_PuV = valve_flow(P['RV'], P['PA1'], self.R_pulmonary)
+        Q_MiV = valve_flow(P['LA'], P['LV'], self.R_mitral, allow_regurg=True)
+        Q_TrV = valve_flow(P['RA'], P['RV'], self.R_tricuspid, allow_regurg=True)
+        Q_FO  = max(0.0, (P['RA'] - P['LA']) / self.R_FO)
+
+        # ── Regurgitation severity progression ────────────────────
+        if self.flags.valve_regurgitation:
+            V_RV_ratio = V[I_RV] / max(1e-6, V_RV_init) if V_RV_init > 0 else 1.0
+            dilation_excess = max(0.0, V_RV_ratio / self.regurg_V_threshold - 1.0)
+            dx[I_REGURG] = self.regurg_k_growth * dilation_excess * (1.0 - regurg_sev)
+
+        # ===========================================================
+        #  STEP 11: VASCULAR FLOWS
+        # ===========================================================
+        # Helper for flows through baroreflex-modulated beds
+        def R_mod(key):
+            """Return effective resistance for a vascular bed."""
+            R_base = self.R[key]
+            if key in self.baro_R_targets or key in self.chemo_R_targets \
+               or key in self.humoral_R_targets:
+                return R_base * r_factor
+            return R_base
+
+        # ── Aortic / upper body ───────────────────────────────────
+        Q_AA     = (P['AR']  - P['AO1']) / self.R['AA']
+        Q_CaAr   = (P['AO1'] - P['CA'])  / self.R['CAR']
+        Q_ScAr   = (P['AO1'] - P['UB'])  / R_mod('UB')
+        Q_ISTH   = (P['AO1'] - P['AO2']) / self.R['ISTHS']
+
+        Q_CA_BR  = (P['CA']  - P['BR'])  / R_CA_BR_eff
+        Q_BR_SVC = (P['BR']  - P['SVC']) / R_mod('BR')
+        Q_UB_SVC = (P['UB']  - P['SVC']) / self.R['UB_SVC']
+        Q_SVC_RA = (P['SVC'] - P['RA'])  / self.R['SVC']
+
+        # ── Pulmonary ─────────────────────────────────────────────
+        Q_PA       = (P['PA1'] - P['PA2'])  / self.R['PA']
+        Q_DA       = (P['PA2'] - P['AO2'])  / R_DA_eff
+        Q_PA2_LUNG = (P['PA2'] - P['LUNG']) / R_LUNG_eff
+        Q_LUNG_LA  = (P['LUNG']- P['LA'])   / self.R['LA']
+
+        # ── Descending aorta / abdominal ──────────────────────────
+        Q_HIAT   = (P['AO2'] - P['AO3']) / self.R['THAO']
+        Q_ILIA   = (P['AO3'] - P['AO4']) / self.R['ADAO']
+        Q_CEL    = (P['AO3'] - P['HE'])   / R_mod('COEL')
+        Q_MES    = (P['AO3'] - P['INTE']) / R_mod('MES')
+        Q_RENAr  = (P['AO3'] - P['KID']) / R_mod('REA')
+
+        # ── Lower body / venous return ────────────────────────────
+        Q_POR     = (P['INTE'] - P['HE'])  / self.R['POR']
+        Q_RENVe   = (P['KID']  - P['IVC']) / self.R['REV']
+        Q_FA      = (P['AO4']  - P['LEG']) / R_mod('FA')
+        Q_AO4_UA  = (P['AO4']  - P['UA'])  / self.R['AO4_UA']
+        Q_DV      = max(0.0, (P['UV'] - P['IVC']) / self.R['DV'])
+        Q_PRSN    = (P['UV']  - P['HE'])   / self.R['PRSN']
+        Q_LEG_IVC = (P['LEG'] - P['IVC'])  / self.R['LEG_IVC']
+        Q_HVe     = (P['HE']  - P['IVC'])  / self.R['HV']
+        Q_IVC_RA  = (P['IVC'] - P['RA'])   / self.R['IVC']
+
+        # ── AP circuit ────────────────────────────────────────────
+        dQ_AP, _, _, _, _ = self.ap_loop(P['UA'], P['UV'], Q_AP)
+        dx[I_Q_AP] = dQ_AP
+
+        # ===========================================================
+        #  STEP 12: MASS BALANCE (dV/dt for each compartment)
+        # ===========================================================
+        dV = dx[0:23]
+        dV[I_AR]   = Q_AoV - Q_AA
+        dV[I_AO1]  = Q_AA  - Q_CaAr - Q_ScAr - Q_ISTH
+        dV[I_AO2]  = Q_ISTH + Q_DA - Q_HIAT
+        dV[I_AO3]  = Q_HIAT - Q_ILIA - Q_CEL - Q_MES - Q_RENAr
+        dV[I_AO4]  = Q_ILIA - Q_AO4_UA - Q_FA
+        dV[I_CA]   = Q_CaAr - Q_CA_BR
+        dV[I_BR]   = Q_CA_BR - Q_BR_SVC
+        dV[I_UB]   = Q_ScAr - Q_UB_SVC
+        dV[I_PA1]  = Q_PuV - Q_PA
+        dV[I_PA2]  = Q_PA  - Q_PA2_LUNG - Q_DA
+        dV[I_LUNG] = Q_PA2_LUNG - Q_LUNG_LA
+        dV[I_KID]  = Q_RENAr - Q_RENVe
+        dV[I_HE]   = Q_CEL + Q_POR + Q_PRSN - Q_HVe
+        dV[I_INTE] = Q_MES - Q_POR
+        dV[I_LEG]  = Q_FA  - Q_LEG_IVC
+        dV[I_UA]   = Q_AO4_UA - Q_AP
+        dV[I_UV]   = Q_AP  - Q_PRSN - Q_DV
+        dV[I_SVC]  = Q_UB_SVC + Q_BR_SVC - Q_SVC_RA
+        dV[I_IVC]  = Q_RENVe + Q_LEG_IVC + Q_HVe + Q_DV - Q_IVC_RA
+        dV[I_RA]   = Q_SVC_RA + Q_IVC_RA - Q_TrV - Q_FO
+        dV[I_LA]   = Q_LUNG_LA + Q_FO - Q_MiV
+        dV[I_RV]   = Q_TrV - Q_PuV
+        dV[I_LV]   = Q_MiV - Q_AoV
+
+        return dx
+
+    # ──────────────────────────────────────────────────────────────
+    #  SIMULATION RUNNER
+    # ──────────────────────────────────────────────────────────────
+
+    def run_simulation(self, duration=8.0):
+        """Integrate the ODE system for `duration` seconds."""
+        P_init = 16.5
+
+        # ── Initial volumes ───────────────────────────────────────
+        x0 = np.zeros(N_STATES)
+        for i, c in enumerate(self.c_list):
+            x0[i] = c * P_init
+        x0[I_RA], x0[I_LA], x0[I_RV], x0[I_LV] = 4.0, 2.0, 10.4, 6.5
+        x0[0:23] *= BLOOD_VOLUME / x0[0:23].sum()
+
+        # Cache initial volumes (used by Vu calculation & Frank-Starling)
+        self._V_init    = x0[0:19].copy()    # vascular compartments
+        self._V_RV_init = x0[I_RV]
+        self._V_LV_init = x0[I_LV]
+
+        # ── Compute initial pressures ─────────────────────────────
+        P_AR_init  = x0[I_AR]  / self.C['AR']
+        P_KID_init = x0[I_KID] / self.C['KID']
+        P_AO1_init = x0[I_AO1] / self.C['AO1']
+        P_CA_init  = x0[I_CA]  / self.C['CA']
+
+        # ── Initial mechanism states ──────────────────────────────
+        # P_CS: filtered baroreceptor pressure = actual initial arterial P
+        x0[I_P_CS]      = P_AR_init
+
+        x0[I_Q_AP]      = self.steady_state_flow(
+                              x0[I_UA] / self.C['UA'],
+                              x0[I_UV] / self.C['UV'])
+
+        # Baroreflex effectors at baseline (tonic activity)
+        x0[I_BARO_HR_S] = 0.5    # moderate tonic sympathetic
+        x0[I_BARO_HR_V] = 0.5    # moderate tonic vagal
+        x0[I_BARO_R_S]  = 0.5
+        x0[I_BARO_VU_S] = 0.5
+        x0[I_BARO_E_S]  = 0.5
+
+        x0[I_C_CAT]     = self.cat_C_peak if self.flags.catecholamine_stress else 1.0
+        x0[I_EDEMA]     = 0.0     # no edema initially
+        x0[I_RAAS]      = 0.0     # baseline RAAS
+        x0[I_AVP]       = 0.0     # baseline AVP
+        x0[I_X_AUTO]    = self.R['CA_BR']  # baseline cerebral resistance
+        x0[I_REGURG]    = 0.0     # no regurgitation
+
+        # ── Auto-calibrate set-points from initial pressures ──────
+        # Baroreflex: set-point = initial arterial pressure so sigmoid
+        # is centered (n_baro ≈ 0.5) at baseline → tonic balance
+        self._baro_P_set_cal = self.baro_P_set if self.baro_P_set is not None \
+                               else P_AR_init
+        # Baroreflex slope: calibrate so ±30% pressure change spans
+        # the 10–90% range of the sigmoid.  sigmoid(k*ΔP)=0.9 when
+        # k*ΔP = ln(9) ≈ 2.2, so k = 2.2 / (0.30 * P_set)
+        self._baro_k_cal = self.baro_k if self.baro_k is not None \
+                           else 2.2 / (0.30 * max(1e-3, self._baro_P_set_cal))
+
+        # RAAS: activates when renal pressure drops below baseline
+        self._raas_P_half_cal = self.raas_P_half if self.raas_P_half is not None \
+                                else P_KID_init
+        self._raas_k_cal = self.raas_k if self.raas_k is not None \
+                           else 2.2 / (0.30 * max(1e-3, P_KID_init))
+
+        # AVP: activates when arterial pressure drops below baseline
+        self._avp_P_half_cal = self.avp_P_half if self.avp_P_half is not None \
+                               else P_AR_init
+        self._avp_k_cal = self.avp_k if self.avp_k is not None \
+                          else 2.2 / (0.30 * max(1e-3, P_AR_init))
+
+        # Cerebral autoregulation reference
+        if self.auto_P_ref is None:
+            self.auto_P_ref = (P_AO1_init + P_CA_init) / 2.0
+
+        # ── Diagnostic printout ───────────────────────────────────
+        print(f"  Init pressures: P_AR={P_AR_init:.2f}  P_KID={P_KID_init:.2f}")
+        print(f"  Auto-cal baro: P_set={self._baro_P_set_cal:.2f}  k={self._baro_k_cal:.3f}")
+        print(f"  Auto-cal RAAS: P_half={self._raas_P_half_cal:.2f}  k={self._raas_k_cal:.3f}")
+        print(f"  Auto-cal AVP:  P_half={self._avp_P_half_cal:.2f}  k={self._avp_k_cal:.3f}")
+
+        # ── Integrate ─────────────────────────────────────────────
+        return solve_ivp(
+            self.compute_derivatives, [0, duration], x0,
+            method='Radau', max_step=0.002,
+            rtol=1e-6, atol=1e-8
+        )
+
+
+# ╔══════════════════════════════════════════════════════════════════╗
+# ║  POST-PROCESSING                                                 ║
+# ╚══════════════════════════════════════════════════════════════════╝
+
+def post_process(sol, model):
+    """Re-derive AP node pressures at every saved solver time step."""
+    dp_pump, q_ap = [], []
+    pre_ecmo_list, post_ecmo_list, post_restr_list, p_ua_list = [], [], [], []
+
+    for i in range(len(sol.t)):
+        V  = sol.y[0:23, i]
+        P_UA = V[I_UA] / model.C['UA']
+        P_UV = V[I_UV] / model.C['UV']
+        Q_AP_t = sol.y[I_Q_AP, i]
+
+        dQ, pump, pre_e, post_e, post_r = model.ap_loop(P_UA, P_UV, Q_AP_t)
+
+        p_ua_list.append(P_UA)
+        pre_ecmo_list.append(pre_e)
+        post_ecmo_list.append(post_e)
+        post_restr_list.append(post_r)
+        dp_pump.append(pump)
+        q_ap.append(Q_AP_t)
+
+    return (np.array(dp_pump), np.array(q_ap),
+            np.array(pre_ecmo_list), np.array(post_ecmo_list),
+            np.array(post_restr_list), np.array(p_ua_list))
+
+
+# ╔══════════════════════════════════════════════════════════════════╗
+# ║  PLOTTING                                                      ║
+# ╚══════════════════════════════════════════════════════════════════╝
+
+def comparison_plots(sol, model, clin, start_str, end_str):
+    dp_pump_m, q_ap_m, pre_ecmo_m, post_ecmo_m, post_restr_m, ua_m = \
+        post_process(sol, model)
+    t_model = sol.t
+
+    mask = clin.get_time_window_indices(start_str, end_str)
+    if mask.sum() == 0:
+        raise ValueError(f"No clinical rows between {start_str} and {end_str}.")
+
+    t_c = clin._times[mask] - clin._times[mask][0]
+    q_c = clin._flow_ml_s[mask] * 60.0
+    q_m = q_ap_m * 60.0
+
+    plt.rcParams.update({'font.size': 12})
+    fig, axes = plt.subplots(2, 4, figsize=(24, 10))
+    axes = axes.flatten()
+
+    # Build toggles summary string
+    flags = model.flags
+    on = [name for name, val in vars(flags).items() if val]
+    title = (f"LPM v16 vs Clinical  |  {start_str}–{end_str}  "
+             f"({t_c[-1]:.1f}s)  |  Mechanisms ON: {', '.join(on)}")
+    fig.suptitle(title, fontsize=13, fontweight='bold')
+
+    def _plot(ax, y_c, y_m, yl, ttl, ybot=None):
+        ax.plot(t_c, y_c, 'g', lw=1.5, label='Clinical')
+        ax.plot(t_model, y_m, 'r', lw=1.5, ls='-', label='Model')
+        ax.set_xlabel('Time (s)'); ax.set_ylabel(yl); ax.set_title(ttl)
+        ax.legend(fontsize=10); ax.grid(True, alpha=0.3)
+        if ybot is not None:
+            ax.set_ylim(bottom=ybot)
+
+    _plot(axes[0], clin._dp_pump[mask], dp_pump_m, 'mmHg', 'Pump ΔP')
+    _plot(axes[1], q_c, q_m, 'mL/min', 'AP Flow')
+    _plot(axes[4], clin._p_pre_pump[mask], ua_m, 'mmHg', 'Pre-Pump P')
+    _plot(axes[5], clin._p_pre_ecmo[mask], pre_ecmo_m, 'mmHg', 'Pre-ECMO P', 0)
+    _plot(axes[6], clin._p_post_ecmo[mask], post_ecmo_m, 'mmHg', 'Post-ECMO P', 0)
+    _plot(axes[7], clin._p_post_res[mask], post_restr_m, 'mmHg', 'Post-Restrictor P', 0)
+    _plot(axes[2], clin._p_pre_ecmo[mask] - clin._p_post_ecmo[mask],
+          pre_ecmo_m - post_ecmo_m, 'mmHg', 'ECMO ΔP')
+    _plot(axes[3], clin._p_post_ecmo[mask] - clin._p_post_res[mask],
+          post_ecmo_m - post_restr_m, 'mmHg', 'Restrictor ΔP')
+
+    plt.tight_layout(); plt.subplots_adjust(top=0.90); plt.show()
+
+
+def mechanism_diagnostics(sol, model):
+    """Plot the time evolution of all mechanism state variables."""
+    t = sol.t
+    labels = {
+        I_P_CS:      'P_cs (filtered)',
+        I_BARO_HR_S: 'Baro σ_HR_symp',
+        I_BARO_HR_V: 'Baro σ_HR_vag',
+        I_BARO_R_S:  'Baro σ_R_symp',
+        I_BARO_VU_S: 'Baro σ_Vu_symp',
+        I_BARO_E_S:  'Baro σ_E_symp',
+        I_C_CAT:     'Catecholamine',
+        I_EDEMA:     'Edema',
+        I_RAAS:      'RAAS',
+        I_AVP:       'AVP',
+        I_X_AUTO:    'Cerebral R_auto',
+        I_REGURG:    'Regurg severity',
+    }
+    n = len(labels)
+    fig, axes = plt.subplots((n + 2) // 3, 3, figsize=(18, 3 * ((n + 2) // 3)))
+    axes = axes.flatten()
+    for ax_i, (idx, label) in enumerate(labels.items()):
+        axes[ax_i].plot(t, sol.y[idx], 'b', lw=1)
+        axes[ax_i].set_title(label, fontsize=11)
+        axes[ax_i].set_xlabel('Time (s)')
+        axes[ax_i].grid(True, alpha=0.3)
+    for ax_i in range(len(labels), len(axes)):
+        axes[ax_i].set_visible(False)
+    plt.suptitle('Mechanism State Variables', fontsize=14, fontweight='bold')
+    plt.tight_layout(); plt.subplots_adjust(top=0.93); plt.show()
+
+
+# ╔══════════════════════════════════════════════════════════════════╗
+# ║  MAIN                                                          ║
+# ╚══════════════════════════════════════════════════════════════════╝
+
+if __name__ == '__main__':
+    # Bootstrap: allow running this file directly from any directory.
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    from project_paths import clinical_csv
+    csv_path = clinical_csv()
+
+    fmt = "%H:%M:%S"
+    t0 = datetime.strptime(START_TIME, fmt)
+    t1 = datetime.strptime(END_TIME, fmt)
+    window_s = (t1 - t0).total_seconds()
+    if window_s <= 0:
+        raise ValueError("END_TIME must be after START_TIME.")
+
+    # ── Configure mechanism toggles ───────────────────────────────
+    # Set any to False to disable:
+    toggles = MechanismToggles()
+    toggles.baroreflex             = True
+    toggles.frank_starling         = True
+    toggles.catecholamine_stress   = True
+    toggles.myocardial_edema       = True
+    toggles.venous_unstressed_vol  = True  # off by default (needs Vu_frac tuning)
+    toggles.chemoreflex            = True
+    toggles.cerebral_autoregulation = True
+    toggles.da_reactivity          = True
+    toggles.pvr_modulation         = True
+    toggles.valve_regurgitation    = True
+    toggles.raas                   = True
+    toggles.vasopressin            = True
+
+    model = ArtificialPlacentaModel(toggles=toggles)
+
+    print(f"Clinical window: {START_TIME} → {END_TIME}  ({window_s:.0f} s)")
+    print(f"AP circuit: R_tot={model.R_ap_tot:.4f}, L_tot={model.L_ap_tot:.4f}")
+    print(f"Mechanisms ON: {[k for k,v in vars(toggles).items() if v]}")
+    print(f"Mechanisms OFF: {[k for k,v in vars(toggles).items() if not v]}")
+
+    sol = model.run_simulation(duration=window_s)
+    print(f"Simulation complete. Solver steps: {len(sol.t)}")
+
+    # ── Plot mechanism diagnostics ────────────────────────────────
+    mechanism_diagnostics(sol, model)
+
+    # ── Compare with clinical data if CSV exists ──────────────────
+    if os.path.isfile(csv_path):
+        clin = ClinicalData(csv_path)
+        comparison_plots(sol, model, clin, START_TIME, END_TIME)
+    else:
+        print(f"Clinical CSV not found at {csv_path}; skipping comparison plots.")
