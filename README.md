@@ -1,5 +1,12 @@
 # Artificial_Placenta_LPM — Fetal Cardiovascular Lumped-Parameter Models
 
+**Investigating Mechanisms of Hemodynamic Instability in Artificial Placenta Systems
+Using Lumped Parameter Models** — ATOMS Lab, University of Toronto.
+
+[![Research poster: Investigating Mechanisms of Hemodynamic Instability in Artificial Placenta Systems Using Lumped Parameter Models](poster/poster.png)](poster/poster.pdf)
+
+*Click the poster for the full-resolution PDF.*
+
 Lumped-parameter (LPM) models of the fetal circulation connected to a pumped
 artificial placenta (AP) circuit, fitted against a March 2024 ECMO trial recording.
 
@@ -19,7 +26,8 @@ Artificial_Placenta_LPM/
 │                         profile likelihood, sensitivity, v18 generator, poster plots
 ├── data/                 Clinical recordings — NOT included; see data/README.md
 ├── results/              Generated outputs, one subfolder per tool
-├── poster/               Poster figures (from analysis/make_poster_plots.py)
+├── poster/               Research poster (poster.pdf / .png) and its figures
+│                         (from analysis/make_poster_plots.py)
 ├── superseded/           v4–v13. Linear ancestry, superseded but valid.
 └── abandoned/            Dead ends. Work that was deliberately backtracked out of.
 ```
